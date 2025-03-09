@@ -5,12 +5,16 @@ import string
 from datetime import datetime, timedelta
 import os
 
+# If you're on Python 3.9+, zoneinfo is in the standard library.
+# For older Python versions, install backports.zoneinfo and import from backports.zoneinfo instead.
+from zoneinfo import ZoneInfo
+
 app = Flask(__name__)
 CORS(app)  # Allow cross-origin requests
 
 # We store license data in a dict:
 #   valid_keys[license_key] = {
-#       "expiration": <datetime>,
+#       "expiration": <datetime (UTC)>,
 #       "assigned_device": <string or None>
 #   }
 valid_keys = {}
@@ -37,23 +41,31 @@ def owner_generate_license():
     duration = payload.get("duration", "1")  # default: 1 day
 
     if duration == "debug":
-        expiration = datetime.utcnow() + timedelta(minutes=2)
+        expiration_utc = datetime.utcnow() + timedelta(minutes=2)
     else:
         try:
             days = int(duration)
-            expiration = datetime.utcnow() + timedelta(days=days)
+            expiration_utc = datetime.utcnow() + timedelta(days=days)
         except ValueError:
             # Fallback if invalid input
-            expiration = datetime.utcnow() + timedelta(days=1)
+            expiration_utc = datetime.utcnow() + timedelta(days=1)
 
     new_key = generate_random_key()
+
+    # Store the expiration in UTC internally
     valid_keys[new_key] = {
-        "expiration": expiration,
+        "expiration": expiration_utc,
         "assigned_device": None  # not assigned to any device yet
     }
+
+    # Convert the UTC expiration to Philippine Time (Asia/Manila)
+    ph_tz = ZoneInfo("Asia/Manila")
+    expiration_ph = expiration_utc.astimezone(ph_tz)
+
     return jsonify({
         "license_key": new_key,
-        "expires_at": expiration.isoformat() + "Z"
+        # Return the local time in ISO format (e.g., 2025-03-10T14:53:36.207138+08:00)
+        "expires_at": expiration_ph.isoformat()
     })
 
 @app.route('/client/verify_license', methods=['GET'])
@@ -75,7 +87,7 @@ def verify_license():
     if not license_data:
         return jsonify({"valid": False})
 
-    # Check if expired
+    # Check if expired (compare with current UTC time)
     if datetime.utcnow() >= license_data["expiration"]:
         # Optionally remove it from the dict
         valid_keys.pop(license_key, None)
