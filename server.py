@@ -1,23 +1,42 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 import secrets
 import string
 from datetime import datetime, timedelta
 import os
-
-# If you're on Python 3.9+, zoneinfo is in the standard library.
-# For older Python versions, install backports.zoneinfo and import from backports.zoneinfo instead.
+import logging
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 CORS(app)  # Allow cross-origin requests
 
-# We store license data in a dict:
-#   valid_keys[license_key] = {
-#       "expiration": <datetime (UTC)>,
-#       "assigned_device": <string or None>
-#   }
-valid_keys = {}
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Configure SQLite Database URI (use file-based database for simplicity)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///licenses.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+# Timezone for conversion
+ph_tz = ZoneInfo("Asia/Manila")
+
+# License model for SQLite
+class License(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    license_key = db.Column(db.String(16), unique=True, nullable=False)
+    expiration = db.Column(db.DateTime, nullable=False)
+    assigned_device = db.Column(db.String(100), nullable=True)
+
+    def __repr__(self):
+        return f'<License {self.license_key}>'
+
+# Initialize the database (run this once to create the schema)
+@app.before_first_request
+def create_tables():
+    db.create_all()
 
 def generate_random_key(length=16, group_size=4):
     """
@@ -27,83 +46,88 @@ def generate_random_key(length=16, group_size=4):
     raw_key = ''.join(secrets.choice(alphabet) for _ in range(length))
     return '-'.join(raw_key[i:i+group_size] for i in range(0, length, group_size))
 
+def parse_duration(duration_str):
+    """ Helper function to parse the duration string into a timedelta object. """
+    if duration_str == "debug":
+        return timedelta(minutes=2)
+    try:
+        days = int(duration_str)
+        return timedelta(days=days)
+    except ValueError:
+        return timedelta(days=1)  # Default to 1 day if invalid input
+
 @app.route('/owner/generate_license', methods=['POST'])
 def owner_generate_license():
     """
-    Owner endpoint: Generates a new license key with expiration.
-    Expects JSON payload:
-      { "duration": "1" }   for 1 day
-      { "duration": "2" }   for 2 days
-      { "duration": "3" }   for 3 days
-      { "duration": "debug"} for 2 minutes
+    Generates a new license key with expiration.
+    Expects JSON payload like: { "duration": "1" } or { "duration": "debug" }
     """
     payload = request.get_json(silent=True) or {}
-    duration = payload.get("duration", "1")  # default: 1 day
-
-    if duration == "debug":
-        expiration_utc = datetime.utcnow() + timedelta(minutes=2)
-    else:
-        try:
-            days = int(duration)
-            expiration_utc = datetime.utcnow() + timedelta(days=days)
-        except ValueError:
-            # Fallback if invalid input
-            expiration_utc = datetime.utcnow() + timedelta(days=1)
+    duration = payload.get("duration", "1")  # Default to 1 day if no duration provided
+    
+    expiration_utc = datetime.utcnow() + parse_duration(duration)
 
     new_key = generate_random_key()
 
-    # Store the expiration in UTC internally
-    valid_keys[new_key] = {
-        "expiration": expiration_utc,
-        "assigned_device": None  # not assigned to any device yet
-    }
+    # Store the license in the database
+    new_license = License(
+        license_key=new_key,
+        expiration=expiration_utc,
+        assigned_device=None
+    )
+    db.session.add(new_license)
+    db.session.commit()
 
     # Convert the UTC expiration to Philippine Time (Asia/Manila)
-    ph_tz = ZoneInfo("Asia/Manila")
     expiration_ph = expiration_utc.astimezone(ph_tz)
+
+    logging.debug(f"Generated new license: {new_key}, expires at {expiration_ph.isoformat()}")
 
     return jsonify({
         "license_key": new_key,
-        # Return the local time in ISO format (e.g., 2025-03-10T14:53:36.207138+08:00)
         "expires_at": expiration_ph.isoformat()
     })
 
 @app.route('/client/verify_license', methods=['GET'])
 def verify_license():
     """
-    Client endpoint: Verifies a license key with device ID.
-    Example request:
-      GET /client/verify_license?license_key=ABCD-EFGH&device_id=XXXX
+    Verifies a license key with device ID.
+    Example request: GET /client/verify_license?license_key=ABCD-EFGH&device_id=XXXX
     """
     license_key = request.args.get('license_key')
     device_id = request.args.get('device_id')
 
-    if not license_key:
-        return jsonify({"valid": False, "error": "No license key provided"}), 400
-    if not device_id:
-        return jsonify({"valid": False, "error": "No device ID provided"}), 400
+    if not license_key or not device_id:
+        error_message = "No license key or device ID provided"
+        logging.error(error_message)
+        return jsonify({"valid": False, "error": error_message}), 400
 
-    license_data = valid_keys.get(license_key)
+    # Retrieve the license from the database
+    license_data = License.query.filter_by(license_key=license_key).first()
     if not license_data:
+        logging.warning(f"License key {license_key} not found.")
         return jsonify({"valid": False})
 
-    # Check if expired (compare with current UTC time)
-    if datetime.utcnow() >= license_data["expiration"]:
-        # Optionally remove it from the dict
-        valid_keys.pop(license_key, None)
+    # Check if expired
+    if datetime.utcnow() >= license_data.expiration:
+        db.session.delete(license_data)  # Remove expired license from database
+        db.session.commit()
+        logging.info(f"License key {license_key} expired.")
         return jsonify({"valid": False, "error": "License key expired"})
 
-    # Check if assigned device is None or the same device
-    if license_data["assigned_device"] is None:
-        # First time use: assign to this device
-        license_data["assigned_device"] = device_id
+    # Check if assigned device matches
+    if license_data.assigned_device is None:
+        license_data.assigned_device = device_id
+        db.session.commit()  # Save the device assignment in the database
+        logging.info(f"License key {license_key} assigned to device {device_id}.")
         return jsonify({"valid": True})
-    else:
-        # If already assigned, it must match the requesting device
-        if license_data["assigned_device"] == device_id:
-            return jsonify({"valid": True})
-        else:
-            return jsonify({"valid": False, "error": "License already used on another device"})
+
+    if license_data.assigned_device == device_id:
+        logging.info(f"License key {license_key} validated for device {device_id}.")
+        return jsonify({"valid": True})
+
+    logging.warning(f"License key {license_key} used on different device {license_data.assigned_device}.")
+    return jsonify({"valid": False, "error": "License already used on another device"})
 
 if __name__ == '__main__':
     # Use the PORT environment variable if available, otherwise default to 5000.
