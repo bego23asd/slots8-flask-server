@@ -11,16 +11,17 @@ from zoneinfo import ZoneInfo
 app = Flask(__name__)
 CORS(app)  # Allow cross-origin requests
 
-# Setup logging
+# Setup logging configuration
 logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Configure SQLite Database URI (use file-based database for simplicity)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///licenses.db'
+# Configuration setup (add your production URI if deploying in production)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///licenses.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
-# Timezone for conversion
+# Timezone for conversion (Asia/Manila)
 ph_tz = ZoneInfo("Asia/Manila")
 
 # License model for SQLite
@@ -81,7 +82,7 @@ def owner_generate_license():
     # Convert the UTC expiration to Philippine Time (Asia/Manila)
     expiration_ph = expiration_utc.astimezone(ph_tz)
 
-    logging.debug(f"Generated new license: {new_key}, expires at {expiration_ph.isoformat()}")
+    logger.debug(f"Generated new license: {new_key}, expires at {expiration_ph.isoformat()}")
 
     return jsonify({
         "license_key": new_key,
@@ -99,34 +100,35 @@ def verify_license():
 
     if not license_key or not device_id:
         error_message = "No license key or device ID provided"
-        logging.error(error_message)
+        logger.error(error_message)
         return jsonify({"valid": False, "error": error_message}), 400
 
     # Retrieve the license from the database
     license_data = License.query.filter_by(license_key=license_key).first()
+
     if not license_data:
-        logging.warning(f"License key {license_key} not found.")
-        return jsonify({"valid": False})
+        logger.warning(f"License key {license_key} not found.")
+        return jsonify({"valid": False, "error": "License key not found"})
 
     # Check if expired
     if datetime.utcnow() >= license_data.expiration:
         db.session.delete(license_data)  # Remove expired license from database
         db.session.commit()
-        logging.info(f"License key {license_key} expired.")
+        logger.info(f"License key {license_key} expired.")
         return jsonify({"valid": False, "error": "License key expired"})
 
     # Check if assigned device matches
     if license_data.assigned_device is None:
         license_data.assigned_device = device_id
         db.session.commit()  # Save the device assignment in the database
-        logging.info(f"License key {license_key} assigned to device {device_id}.")
+        logger.info(f"License key {license_key} assigned to device {device_id}.")
         return jsonify({"valid": True})
 
     if license_data.assigned_device == device_id:
-        logging.info(f"License key {license_key} validated for device {device_id}.")
+        logger.info(f"License key {license_key} validated for device {device_id}.")
         return jsonify({"valid": True})
 
-    logging.warning(f"License key {license_key} used on different device {license_data.assigned_device}.")
+    logger.warning(f"License key {license_key} used on different device {license_data.assigned_device}.")
     return jsonify({"valid": False, "error": "License already used on another device"})
 
 if __name__ == '__main__':
